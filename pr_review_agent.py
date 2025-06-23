@@ -17,8 +17,6 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from datetime import datetime
 
-# Load environment variables
-load_dotenv()
 
 # FastAPI app for webhook server
 app = FastAPI(title="GitHub PR Review Agent", version="1.0.0")
@@ -40,22 +38,31 @@ class PRReviewState(TypedDict):
     webhook_event: Optional[dict]
     error: Optional[str]
 
-# Initialize the LLM
-llm = ChatOpenAI(
-    model="gpt-4",
-    temperature=0.1,
-    api_key=os.getenv("OPENAI_API_KEY")
-)
-
 # Initialize GitHub client
 github_client = Github(os.getenv("GITHUB_TOKEN"))
 
 def verify_webhook_signature(payload_body: bytes, signature_header: str, secret: str) -> bool:
     """
-    Verify GitHub webhook signature for security
+    Validates the integrity and authenticity of a GitHub webhook payload using HMAC SHA-256.
+
+    Args:
+        payload_body (bytes): The raw request body received from GitHub.
+        signature_header (str): The value of the 'X-Hub-Signature-256' header sent by GitHub.
+        secret (str): The shared webhook secret configured on GitHub and known to your server.
+
+    Returns:
+        bool: True if the signature is valid; raises HTTPException (401) otherwise.
+
+    Raises:
+        HTTPException: If the signature header is missing or the computed HMAC does not match 
+                       the signature provided by GitHub.
+
+    Security:
+        This function ensures that the incoming webhook request was sent by GitHub and has not 
+        been tampered with, by comparing the provided signature against a locally computed HMAC.
     """
     if not signature_header:
-        return False
+        raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
     
     hash_object = hmac.new(
         secret.encode('utf-8'),
@@ -76,15 +83,15 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         payload_body = await request.body()
         signature = request.headers.get("X-Hub-Signature-256")
         event_type = request.headers.get("X-GitHub-Event")
+
+        # Check if event type is supported
+        if event_type != "pull_request":
+            raise HTTPException(status_code=400, detail=f"Unsupported event type: {event_type}")
         
         # Verify webhook signature if secret is configured
         webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
         if webhook_secret and not verify_webhook_signature(payload_body, signature, webhook_secret):
             raise HTTPException(status_code=401, detail="Invalid signature")
-        
-        # Check if event type is supported
-        if event_type != "pull_request":
-            raise HTTPException(status_code=400, detail=f"Unsupported event type: {event_type}")
         
         # Parse JSON payload
         payload = json.loads(payload_body.decode('utf-8'))
@@ -909,6 +916,16 @@ def start_webhook_server(host: str = "0.0.0.0", port: int = 8000):
 # Example usage and CLI interface
 if __name__ == "__main__":
     import sys
+
+    # Load environment variables
+    load_dotenv()
+
+    # Initialize the LLM
+    llm = ChatOpenAI(
+        model="gpt-4",
+        temperature=0.1,
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
     
     # Check environment variables
     if not os.getenv("OPENAI_API_KEY"):
