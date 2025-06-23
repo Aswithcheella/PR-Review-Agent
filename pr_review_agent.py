@@ -1,7 +1,3 @@
-# GitHub PR Review Agent with Webhooks and Comment Posting
-# Install required packages:
-# pip install langgraph langchain-openai python-dotenv requests PyGithub fastapi uvicorn hmac hashlib
-
 import os
 import re
 import hmac
@@ -29,6 +25,9 @@ app = FastAPI(title="GitHub PR Review Agent", version="1.0.0")
 
 # State Schema - This defines what data flows through our graph
 class PRReviewState(TypedDict):
+    """
+    State for GitHub PR Review workflow
+    """
     pr_url: str
     repo_owner: str
     repo_name: str
@@ -82,6 +81,10 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
         if webhook_secret and not verify_webhook_signature(payload_body, signature, webhook_secret):
             raise HTTPException(status_code=401, detail="Invalid signature")
+        
+        # Check if event type is supported
+        if event_type != "pull_request":
+            raise HTTPException(status_code=400, detail=f"Unsupported event type: {event_type}")
         
         # Parse JSON payload
         payload = json.loads(payload_body.decode('utf-8'))
