@@ -1,35 +1,205 @@
 import os
 import re
-from dotenv import load_dotenv
+import hmac
+import hashlib
+import asyncio
+import requests
 from typing import TypedDict, List, Optional
-from langgraph.graph import StateGraph, END, START
+from dotenv import load_dotenv
+from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 from github import Github, GithubException
 import base64
+import json
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+import uvicorn
+from datetime import datetime
 
-load_dotenv()
 
-#Stae Schema - this defines the structure of the data that flows through the state graph
+# FastAPI app for webhook server
+app = FastAPI(title="GitHub PR Review Agent", version="1.0.0")
+
+# State Schema - This defines what data flows through our graph
 class PRReviewState(TypedDict):
+    """
+    State for GitHub PR Review workflow
+    """
     pr_url: str
     repo_owner: str
     repo_name: str
     pr_number: int
     pr_data: Optional[dict]
-    files_changed: List[str]
-    review_comments: List[str]
+    files_changed: List[dict]
+    review_comments: List[dict]
     final_summary: Optional[str]
+    github_comments_posted: bool
+    webhook_event: Optional[dict]
     error: Optional[str]
 
-#initialize the llm
-llm = ChatOpenAI(
-    model="gpt-4o",
-    temperature=0.1,
-    api_key=os.getenv("OPENAI_API_KEY")
-)
-
+# Initialize GitHub client
 github_client = Github(os.getenv("GITHUB_TOKEN"))
+
+def verify_webhook_signature(payload_body: bytes, signature_header: str, secret: str) -> bool:
+    """
+    Validates the integrity and authenticity of a GitHub webhook payload using HMAC SHA-256.
+
+    Args:
+        payload_body (bytes): The raw request body received from GitHub.
+        signature_header (str): The value of the 'X-Hub-Signature-256' header sent by GitHub.
+        secret (str): The shared webhook secret configured on GitHub and known to your server.
+
+    Returns:
+        bool: True if the signature is valid; raises HTTPException (401) otherwise.
+
+    Raises:
+        HTTPException: If the signature header is missing or the computed HMAC does not match 
+                       the signature provided by GitHub.
+
+    Security:
+        This function ensures that the incoming webhook request was sent by GitHub and has not 
+        been tampered with, by comparing the provided signature against a locally computed HMAC.
+    """
+    if not signature_header:
+        raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
+    
+    hash_object = hmac.new(
+        secret.encode('utf-8'),
+        msg=payload_body,
+        digestmod=hashlib.sha256
+    )
+    expected_signature = "sha256=" + hash_object.hexdigest()
+    
+    return hmac.compare_digest(expected_signature, signature_header)
+
+@app.post("/webhook/github")
+async def github_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    GitHub webhook endpoint to receive PR events
+    """
+    try:
+        # Get raw payload
+        payload_body = await request.body()
+        signature = request.headers.get("X-Hub-Signature-256")
+        event_type = request.headers.get("X-GitHub-Event")
+
+        # Check if event type is supported
+        if event_type != "pull_request":
+            raise HTTPException(status_code=400, detail=f"Unsupported event type: {event_type}")
+        
+        # Verify webhook signature if secret is configured
+        webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
+        if webhook_secret and not verify_webhook_signature(payload_body, signature, webhook_secret):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+        
+        # Parse JSON payload
+        payload = json.loads(payload_body.decode('utf-8'))
+        
+        print(f"📨 Received GitHub webhook: {event_type}")
+        
+        # Handle pull request events
+        if event_type == "pull_request":
+            action = payload.get("action")
+            pr_data = payload.get("pull_request", {})
+            
+            # Trigger review for opened, reopened, or synchronized PRs
+            if action in ["opened", "reopened", "synchronize"]:
+                pr_url = pr_data.get("html_url")
+                pr_number = pr_data.get("number")
+                repo_name = payload.get("repository", {}).get("full_name")
+                
+                print(f"🚀 Triggering AI review for PR #{pr_number}: {pr_url}")
+                
+                # Run review in background to respond quickly to webhook
+                background_tasks.add_task(
+                    process_webhook_pr_review,
+                    pr_url,
+                    payload
+                )
+                
+                return JSONResponse({
+                    "status": "success",
+                    "message": f"AI review triggered for PR #{pr_number}",
+                    "pr_url": pr_url
+                })
+            else:
+                return JSONResponse({
+                    "status": "ignored",
+                    "message": f"PR action '{action}' does not trigger review"
+                })
+        
+        return JSONResponse({
+            "status": "ignored",
+            "message": f"Event type '{event_type}' not handled"
+        })
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except Exception as e:
+        print(f"❌ Webhook error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+async def process_webhook_pr_review(pr_url: str, webhook_payload: dict):
+    """
+    Process PR review triggered by webhook
+    """
+    try:
+        print(f"🔄 Processing webhook PR review for: {pr_url}")
+        result = review_pr_from_webhook(pr_url, webhook_payload)
+        
+        if result.get("error"):
+            print(f"❌ Webhook review failed: {result['error']}")
+        else:
+            print(f"✅ Webhook review completed successfully")
+            
+    except Exception as e:
+        print(f"❌ Error processing webhook PR review: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint
+    """
+    return JSONResponse({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "GitHub PR Review Agent"
+    })
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint with service info
+    """
+    return JSONResponse({
+        "service": "GitHub PR Review Agent",
+        "version": "1.0.0",
+        "endpoints": {
+            "webhook": "/webhook/github",
+            "health": "/health"
+        },
+        "github_api_status": check_github_access_status()
+    })
+
+def check_github_access_status() -> dict:
+    """
+    Check GitHub API access status
+    """
+    try:
+        user = github_client.get_user()
+        rate_limit = github_client.get_rate_limit()
+        return {
+            "authenticated": True,
+            "user": user.login,
+            "rate_limit_remaining": rate_limit.core.remaining,
+            "rate_limit_total": rate_limit.core.limit
+        }
+    except Exception as e:
+        return {
+            "authenticated": False,
+            "error": str(e)
+        }
 
 def parse_pr_url(pr_url: str) -> tuple:
     """
@@ -43,21 +213,24 @@ def parse_pr_url(pr_url: str) -> tuple:
     
     return match.group(1), match.group(2), int(match.group(3))
 
-# node to fetch PR data
-def fetch_pr_data(State: PRReviewState) -> PRReviewState:
-    """Need to fetch PR data from the Github API.
-       for now we will use a boilerplate data."""
-    # Simulating fetching PR data
-    print("🔍 Fetching PR data...")
-
+def fetch_pr_data(state: PRReviewState) -> PRReviewState:
+    """
+    Node to fetch real PR data from GitHub API
+    """
+    print("📥 Fetching PR data from GitHub...")
+    
     try:
-        repo_owner, repo_name, pr_number = parse_pr_url(State["pr_url"])
+        # Parse PR URL
+        repo_owner, repo_name, pr_number = parse_pr_url(state["pr_url"])
+        
+        # Get repository and PR
         repo = github_client.get_repo(f"{repo_owner}/{repo_name}")
         pr = repo.get_pull(pr_number)
-
-        # fetch PR files
+        
+        # Fetch PR files
         files = list(pr.get_files())
-
+        
+        # Process files and get their content/diffs
         files_changed = []
         for file in files:
             file_data = {
@@ -70,7 +243,7 @@ def fetch_pr_data(State: PRReviewState) -> PRReviewState:
                 "blob_url": file.blob_url,
                 "raw_url": file.raw_url
             }
-
+            
             # For new files or small files, also get the full content
             if file.status in ['added', 'modified'] and file.additions < 500:
                 try:
@@ -86,7 +259,7 @@ def fetch_pr_data(State: PRReviewState) -> PRReviewState:
             
             files_changed.append(file_data)
         
-        #get PR metadata
+        # Get PR metadata
         pr_data = {
             "title": pr.title,
             "description": pr.body or "",
@@ -105,43 +278,45 @@ def fetch_pr_data(State: PRReviewState) -> PRReviewState:
             "assignees": [assignee.login for assignee in pr.assignees],
             "requested_reviewers": [reviewer.login for reviewer in pr.requested_reviewers]
         }
-
+        
         print(f"✅ Successfully fetched PR #{pr_number}: {pr.title}")
         print(f"📊 Files changed: {len(files_changed)}, +{pr.additions}/-{pr.deletions}")
-
+        
         return {
-            **State,
+            **state,
             "repo_owner": repo_owner,
             "repo_name": repo_name,
             "pr_number": pr_number,
             "pr_data": pr_data,
             "files_changed": files_changed
         }
+        
     except GithubException as e:
         error_msg = f"GitHub API error: {e.data.get('message', str(e)) if hasattr(e, 'data') else str(e)}"
         print(f"❌ {error_msg}")
-        return {**State, "error": error_msg}
+        return {**state, "error": error_msg}
+    
     except ValueError as e:
         error_msg = f"URL parsing error: {str(e)}"
         print(f"❌ {error_msg}")
-        return {**State, "error": error_msg}
+        return {**state, "error": error_msg}
+    
     except Exception as e:
         error_msg = f"Unexpected error fetching PR data: {str(e)}"
         print(f"❌ {error_msg}")
-        return {**State, "error": error_msg}
+        return {**state, "error": error_msg}
 
-# node to analyze code changes
-def analyze_code_changes(State: PRReviewState) -> PRReviewState:
+def analyze_code_changes(state: PRReviewState) -> PRReviewState:
     """
     Node to analyze the code changes in the PR using AI
     """
     print("🔍 Analyzing code changes with AI...")
     
-    if not State.get("files_changed"):
-        return {**State, "error": "No files to analyze"}
+    if not state.get("files_changed"):
+        return {**state, "error": "No files to analyze"}
     
     review_comments = []
-    pr_context = State["pr_data"]
+    pr_context = state["pr_data"]
     
     # Create context about the PR
     pr_context_text = f"""
@@ -152,7 +327,7 @@ def analyze_code_changes(State: PRReviewState) -> PRReviewState:
     Total Changes: +{pr_context['additions']}/-{pr_context['deletions']} across {pr_context['changed_files']} files
     """
     
-    for file_change in State["files_changed"]:
+    for file_change in state["files_changed"]:
         print(f"  📄 Analyzing {file_change['filename']}...")
         
         # Skip binary files or very large files
@@ -161,7 +336,8 @@ def analyze_code_changes(State: PRReviewState) -> PRReviewState:
                 "file": file_change['filename'],
                 "comment": "⚠️ Large file or binary file - manual review recommended",
                 "type": "info",
-                "line_number": None
+                "line_number": None,
+                "github_comment": "⚠️ **Large file detected** - This file requires manual review due to its size."
             })
             continue
         
@@ -183,7 +359,7 @@ def analyze_code_changes(State: PRReviewState) -> PRReviewState:
         {language_context}
         
         Be specific about line numbers when possible. Provide both positive feedback and areas for improvement.
-        Format your response with clear sections and actionable suggestions."""
+        Format your response for GitHub comments with clear sections and actionable suggestions."""
         
         human_prompt = f"""
         PR Context:
@@ -201,7 +377,7 @@ def analyze_code_changes(State: PRReviewState) -> PRReviewState:
         
         {f"Full File Content (first 2000 chars):\n```\n{file_change.get('full_content', '')}\n```" if file_change.get('full_content') else ""}
         
-        Please provide a detailed code review for this file.
+        Please provide a detailed code review for this file optimized for GitHub comments.
         """
         
         try:
@@ -211,9 +387,14 @@ def analyze_code_changes(State: PRReviewState) -> PRReviewState:
             ]
             
             response = llm.invoke(messages)
+            
+            # Create GitHub-optimized comment
+            github_comment = format_comment_for_github(response.content, file_change)
+            
             review_comments.append({
                 "file": file_change['filename'],
                 "comment": response.content,
+                "github_comment": github_comment,
                 "type": "ai_review",
                 "line_number": None,
                 "file_status": file_change['status'],
@@ -224,15 +405,35 @@ def analyze_code_changes(State: PRReviewState) -> PRReviewState:
             review_comments.append({
                 "file": file_change['filename'],
                 "comment": f"❌ Error analyzing file: {str(e)}",
+                "github_comment": f"❌ **Analysis Error**: Could not analyze this file due to: {str(e)}",
                 "type": "error",
                 "line_number": None
             })
     
     print(f"✅ Analyzed {len(review_comments)} files")
     return {
-        **State,
+        **state,
         "review_comments": review_comments
     }
+
+def format_comment_for_github(ai_comment: str, file_data: dict) -> str:
+    """
+    Format AI comment for GitHub with proper markdown and emojis
+    """
+    file_name = file_data['filename']
+    file_status = file_data['status']
+    changes = f"+{file_data['additions']}/-{file_data['deletions']}"
+    
+    github_comment = f"""## 🤖 AI Code Review for `{file_name}`
+
+**File Status:** `{file_status}` | **Changes:** `{changes}`
+
+{ai_comment}
+
+---
+*Generated by AI PR Review Agent* 🚀
+"""
+    return github_comment
 
 def get_language_context(file_ext: str) -> str:
     """
@@ -283,7 +484,6 @@ def get_language_context(file_ext: str) -> str:
     
     return language_contexts.get(file_ext, "General code review focusing on best practices and security.")
 
-# node to generate review summary or comments
 def generate_summary(state: PRReviewState) -> PRReviewState:
     """
     Node to generate a comprehensive PR review summary
@@ -375,7 +575,57 @@ def generate_summary(state: PRReviewState) -> PRReviewState:
             **state,
             "error": f"Error generating summary: {str(e)}"
         }
+
+def post_github_comments(state: PRReviewState) -> PRReviewState:
+    """
+    Node to post review comments directly to GitHub PR
+    """
+    print("💬 Posting review comments to GitHub...")
     
+    try:
+        repo = github_client.get_repo(f"{state['repo_owner']}/{state['repo_name']}")
+        pr = repo.get_pull(state['pr_number'])
+        
+        # Post summary comment
+        if state.get("final_summary"):
+            summary_comment = f"""# 🤖 AI Code Review Summary
+
+{state['final_summary']}
+
+---
+*This review was automatically generated by AI PR Review Agent*
+*Review completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}*
+"""
+            pr.create_issue_comment(summary_comment)
+            print("✅ Posted summary comment")
+        
+        # Post individual file review comments
+        comments_posted = 0
+        for review_comment in state.get("review_comments", []):
+            if review_comment["type"] in ["ai_review", "info"] and review_comment.get("github_comment"):
+                try:
+                    pr.create_issue_comment(review_comment["github_comment"])
+                    comments_posted += 1
+                    print(f"✅ Posted comment for {review_comment['file']}")
+                except Exception as e:
+                    print(f"⚠️ Failed to post comment for {review_comment['file']}: {str(e)}")
+        
+        print(f"✅ Successfully posted {comments_posted + 1} comments to GitHub")
+        
+        return {
+            **state,
+            "github_comments_posted": True
+        }
+        
+    except Exception as e:
+        error_msg = f"Error posting GitHub comments: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {
+            **state,
+            "error": error_msg,
+            "github_comments_posted": False
+        }
+
 def should_continue_after_fetch(state: PRReviewState) -> str:
     """
     Conditional edge function after fetching PR data
@@ -407,6 +657,15 @@ def should_continue_after_summary(state: PRReviewState) -> str:
     if state.get("error"):
         return "error_handler"
     else:
+        return "post_github_comments"
+
+def should_continue_after_posting(state: PRReviewState) -> str:
+    """
+    Conditional edge function after posting comments
+    """
+    if state.get("error"):
+        return "error_handler"
+    else:
         return END
 
 def error_handler(state: PRReviewState) -> PRReviewState:
@@ -423,7 +682,8 @@ def no_files_handler(state: PRReviewState) -> PRReviewState:
     print("⚠️  No files changed in this PR")
     return {
         **state,
-        "final_summary": "This PR contains no file changes to review. This might be a documentation-only update or the PR might have issues."
+        "final_summary": "This PR contains no file changes to review. This might be a documentation-only update or the PR might have issues.",
+        "github_comments_posted": False
     }
 
 def no_comments_handler(state: PRReviewState) -> PRReviewState:
@@ -433,7 +693,8 @@ def no_comments_handler(state: PRReviewState) -> PRReviewState:
     print("⚠️  No review comments generated")
     return {
         **state,
-        "final_summary": "No specific issues found during automated review. The changes appear to follow good practices and are ready for manual review."
+        "final_summary": "No specific issues found during automated review. The changes appear to follow good practices and are ready for manual review.",
+        "github_comments_posted": False
     }
 
 def large_pr_handler(state: PRReviewState) -> PRReviewState:
@@ -451,29 +712,31 @@ def large_pr_handler(state: PRReviewState) -> PRReviewState:
     
     return {
         **state,
-        "files_changed": important_files,
-        "final_summary": f"⚠️ This is a large PR with {file_count} files. Automated review focused on the first 20 most critical files. Manual review recommended for completeness."
+        "files_changed": important_files
     }
 
-# build the graph
+# Build the Graph
 def create_pr_review_graph():
-    """Create and configure the LangGraph workflow for PR review."""
-    # Initialize the state with default values
+    """
+    Create and configure the LangGraph workflow with conditional logic
+    """
+    # Initialize the graph
     workflow = StateGraph(PRReviewState)
-    # define node in the workflow
+    
+    # Add nodes
     workflow.add_node("fetch_pr_data", fetch_pr_data)
     workflow.add_node("analyze_code_changes", analyze_code_changes)
     workflow.add_node("generate_summary", generate_summary)
+    workflow.add_node("post_github_comments", post_github_comments)
     workflow.add_node("error_handler", error_handler)
     workflow.add_node("no_files_handler", no_files_handler)
     workflow.add_node("no_comments_handler", no_comments_handler)
     workflow.add_node("large_pr_handler", large_pr_handler)
-
-    # Set the entry point of the workflow
-    workflow.add_edge(START, "fetch_pr_data")
-
+    
+    # Define the entry point
+    workflow.set_entry_point("fetch_pr_data")
+    
     # Add conditional edges using should_continue functions
-
     workflow.add_conditional_edges(
         "fetch_pr_data",
         should_continue_after_fetch,
@@ -484,7 +747,10 @@ def create_pr_review_graph():
             "large_pr_handler": "large_pr_handler"
         }
     )
-
+    
+    # Large PR handler goes to analysis with limited files
+    workflow.add_edge("large_pr_handler", "analyze_code_changes")
+    
     workflow.add_conditional_edges(
         "analyze_code_changes",
         should_continue_after_analysis,
@@ -494,34 +760,45 @@ def create_pr_review_graph():
             "no_comments_handler": "no_comments_handler"
         }
     )
-
+    
     workflow.add_conditional_edges(
         "generate_summary",
         should_continue_after_summary,
         {
-            END: END,
+            "post_github_comments": "post_github_comments",
             "error_handler": "error_handler"
         }
     )
-
-
+    
+    workflow.add_conditional_edges(
+        "post_github_comments",
+        should_continue_after_posting,
+        {
+            "error_handler": "error_handler",
+            END: END
+        }
+    )
+    
+    # Add edges from handler nodes to END
     workflow.add_edge("error_handler", END)
     workflow.add_edge("no_files_handler", END)
     workflow.add_edge("no_comments_handler", END)
-
-    # Compile the workflow
+    
+    # Compile the graph
     return workflow.compile()
 
 # Main execution function
 def review_pr(pr_url: str, detailed_output: bool = False):
-    """Review a pull request by its URL."""
+    """
+    Main function to review a GitHub PR
+    """
     print(f"🚀 Starting AI-powered GitHub PR review for: {pr_url}")
     print("="*80)
-
-    # create the graph
+    
+    # Create the graph
     app = create_pr_review_graph()
-
-    # Initialize the state with the PR URL
+    
+    # Initial state
     initial_state = {
         "pr_url": pr_url,
         "repo_owner": "",
@@ -531,9 +808,12 @@ def review_pr(pr_url: str, detailed_output: bool = False):
         "files_changed": [],
         "review_comments": [],
         "final_summary": None,
+        "github_comments_posted": False,
+        "webhook_event": None,
         "error": None
     }
-
+    
+    # Run the graph
     try:
         result = app.invoke(initial_state)
         
@@ -543,10 +823,15 @@ def review_pr(pr_url: str, detailed_output: bool = False):
         
         # Display results
         print("\n" + "="*80)
-        print("📋 AI GITHUB PR REVIEW SUMMARY")
+        print("📋 AI GITHUB PR REVIEW COMPLETED")
         print("="*80)
         print(result["final_summary"])
         print("="*80)
+        
+        if result.get("github_comments_posted"):
+            print("💬 ✅ Comments posted to GitHub PR")
+        else:
+            print("💬 ⚠️ Comments not posted to GitHub")
         
         if detailed_output and result.get("review_comments"):
             print("\n🔍 DETAILED FILE-BY-FILE REVIEW:")
@@ -566,6 +851,39 @@ def review_pr(pr_url: str, detailed_output: bool = False):
         print(f"❌ {error_msg}")
         return {"error": error_msg}
 
+def review_pr_from_webhook(pr_url: str, webhook_payload: dict):
+    """
+    Review PR triggered from webhook with additional context
+    """
+    print(f"🔗 Processing webhook-triggered review for: {pr_url}")
+    
+    # Create the graph
+    app = create_pr_review_graph()
+    
+    # Initial state with webhook context
+    initial_state = {
+        "pr_url": pr_url,
+        "repo_owner": "",
+        "repo_name": "",
+        "pr_number": 0,
+        "pr_data": None,
+        "files_changed": [],
+        "review_comments": [],
+        "final_summary": None,
+        "github_comments_posted": False,
+        "webhook_event": webhook_payload,
+        "error": None
+    }
+    
+    try:
+        result = app.invoke(initial_state)
+        print(f"🎉 Webhook review completed for PR: {pr_url}")
+        return result
+    except Exception as e:
+        error_msg = f"Webhook review error: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {"error": error_msg}
+
 def check_github_access():
     """
     Check if GitHub API access is working
@@ -579,11 +897,35 @@ def check_github_access():
     except Exception as e:
         print(f"❌ GitHub API access failed: {str(e)}")
         return False
+
+def start_webhook_server(host: str = "0.0.0.0", port: int = 8000):
+    """
+    Start the webhook server
+    """
+    print(f"🚀 Starting GitHub PR Review Agent webhook server...")
+    print(f"📡 Server will run on http://{host}:{port}")
+    print(f"🔗 Webhook endpoint: http://{host}:{port}/webhook/github")
+    print(f"❤️ Health check: http://{host}:{port}/health")
     
-# Example usage
+    if not check_github_access():
+        print("❌ GitHub access check failed. Please check your GITHUB_TOKEN.")
+        return
+    
+    uvicorn.run(app, host=host, port=port)
+
+# Example usage and CLI interface
 if __name__ == "__main__":
-    # Make sure to set your OPENAI_API_KEY in a .env file
     import sys
+
+    # Load environment variables
+    load_dotenv()
+
+    # Initialize the LLM
+    llm = ChatOpenAI(
+        model="gpt-4",
+        temperature=0.1,
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
     
     # Check environment variables
     if not os.getenv("OPENAI_API_KEY"):
@@ -594,35 +936,47 @@ if __name__ == "__main__":
         print("❌ Please set GITHUB_TOKEN in your .env file")
         exit(1)
     
-    # Check GitHub access
-    if not check_github_access():
-        exit(1)
-    
-    # Get PR URL from command line or use example
+    # Command line argument handling
     if len(sys.argv) > 1:
-        pr_url = sys.argv[1]
-        detailed = "--detailed" in sys.argv
+        command = sys.argv[1]
+        
+        if command == "server":
+            # Start webhook server
+            host = sys.argv[2] if len(sys.argv) > 2 else "0.0.0.0"
+            port = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
+            start_webhook_server(host, port)
+            
+        elif command.startswith("http"):
+            # Direct PR review
+            pr_url = command
+            detailed = "--detailed" in sys.argv
+            result = review_pr(pr_url, detailed_output=detailed)
+            
+            if not result.get("error"):
+                print(f"\n🎉 Review completed successfully!")
+                if result.get("pr_data"):
+                    pr_data = result["pr_data"]
+                    print(f"📈 PR Stats: +{pr_data['additions']}/-{pr_data['deletions']} across {pr_data['changed_files']} files")
+            else:
+                print(f"\n💥 Review failed: {result['error']}")
+                exit(1)
+        else:
+            print("Usage:")
+            print("  python pr_review_agent.py server [host] [port]  # Start webhook server")
+            print("  python pr_review_agent.py <PR_URL> [--detailed]  # Review specific PR")
+            print("  python pr_review_agent.py  # Interactive mode")
     else:
-        # Example PR URL - replace with a real PR
-        pr_url = input("Enter GitHub PR URL: ").strip()
-        if not pr_url:
-            print("❌ No PR URL provided")
+        # Interactive mode
+        print("🤖 GitHub PR Review Agent")
+        print("1. Type 'server' to start webhook server")
+        print("2. Enter a GitHub PR URL to review")
+        
+        user_input = input("Choice: ").strip()
+        
+        if user_input.lower() == "server":
+            start_webhook_server()
+        elif user_input.startswith("http"):
+            result = review_pr(user_input, detailed_output=True)
+        else:
+            print("❌ Invalid input. Please enter 'server' or a GitHub PR URL.")
             exit(1)
-        detailed = True
-    
-    # Run the PR review
-    print(f"🤖 Starting AI review of: {pr_url}")
-    result = review_pr(pr_url, detailed_output=detailed)
-    
-    if not result.get("error"):
-        print(f"\n🎉 Review completed successfully!")
-        if result.get("pr_data"):
-            pr_data = result["pr_data"]
-            print(f"📈 PR Stats: +{pr_data['additions']}/-{pr_data['deletions']} across {pr_data['changed_files']} files")
-    else:
-        print(f"\n💥 Review failed: {result['error']}")
-        exit(1)
-
-
-
-    
